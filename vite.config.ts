@@ -8,6 +8,7 @@ export default defineConfig({
     allowedHosts: [
       "heartrenderingly-patellate-gerardo.ngrok-free.dev",
       ".ngrok-free.dev", // allow any ngrok-free.dev subdomain (optional but handy)
+      "https://cricket-live-scorer-alpha.vercel.app/"
     ],
   },
 
