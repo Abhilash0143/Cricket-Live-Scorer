@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { AppShell } from "../ui/AppShell";
 import { Card } from "../ui/Card";
@@ -28,13 +28,14 @@ type InningScore = {
 type MatchPlayer = {
   id: string; // FK target for ball_events striker_id/non_striker_id/bowler_id
   match_id: string;
-  team_id: string;
+  team_id: string | null;
   name: string;
 };
 
 type BatterStats = { runs: number; balls: number; fours: number; sixes: number };
 
 type BallTag = "0" | "1" | "2" | "3" | "4" | "5" | "6" | "W" | "WD" | "NB" | "B" | "LB";
+type NonWicketTag = Exclude<BallTag, "W">;
 
 function emptyStats(): BatterStats {
   return { runs: 0, balls: 0, fours: 0, sixes: 0 };
@@ -120,8 +121,6 @@ export default function Score() {
   const [bowlerId, setBowlerId] = useState<string>("");
 
   const [bowlerName, setBowlerName] = useState("");
-  const [nextBatterName, setNextBatterName] = useState("");
-
 
   const [stats, setStats] = useState<{ striker: BatterStats; nonStriker: BatterStats }>({
     striker: emptyStats(),
@@ -140,64 +139,51 @@ export default function Score() {
   const [wicketOut, setWicketOut] = useState<"striker" | "nonStriker">("striker");
   const [nextBatterId, setNextBatterId] = useState<string>("");
 
-  // NEW: search inputs
-  const [bowlerSearch, setBowlerSearch] = useState("");
+  // search for next batter list
   const [batterSearch, setBatterSearch] = useState("");
 
   // Sticky pad spacing so content isn't hidden
-  const CONTENT_BOTTOM_PAD = 340; // adjust if you change pad height
+  const CONTENT_BOTTOM_PAD = 340;
 
   const overTxt = useMemo(() => oversText(inning.legal_balls), [inning.legal_balls]);
   const crrTxt = useMemo(() => crr(inning.runs, inning.legal_balls), [inning.runs, inning.legal_balls]);
 
+  // ✅ stable toast timer
+  const toastTimerRef = useRef<number | null>(null);
   function pushToast(msg: string) {
     setToast(msg);
-    window.clearTimeout((pushToast as any)._t);
-    (pushToast as any)._t = window.setTimeout(() => setToast(null), 1800);
+    if (toastTimerRef.current) window.clearTimeout(toastTimerRef.current);
+    toastTimerRef.current = window.setTimeout(() => setToast(null), 1800);
   }
+
+  // ✅ refs for realtime callback (avoid resubscribe on strike changes)
+  const strikerIdRef = useRef(strikerId);
+  const nonStrikerIdRef = useRef(nonStrikerId);
+  useEffect(() => void (strikerIdRef.current = strikerId), [strikerId]);
+  useEffect(() => void (nonStrikerIdRef.current = nonStrikerId), [nonStrikerId]);
 
   const striker = useMemo(() => players.find((p) => p.id === strikerId) ?? null, [players, strikerId]);
   const nonStriker = useMemo(() => players.find((p) => p.id === nonStrikerId) ?? null, [players, nonStrikerId]);
   const bowler = useMemo(() => players.find((p) => p.id === bowlerId) ?? null, [players, bowlerId]);
 
-  type NonWicketTag = Exclude<BallTag, "W">;
-
+  // ✅ atomic swap
   function swapStrike() {
-    // safer swap (your old version relied on stale state)
     setStrikerId((s) => {
-      const ns = nonStrikerId;
       setNonStrikerId(s);
-      return ns;
+      return nonStrikerIdRef.current;
     });
-  }
-
-  function findPlayerIdByName(name: string) {
-    const q = name.trim().toLowerCase();
-    if (!q) return "";
-
-    // exact match first
-    const exact = players.find((p) => p.name.trim().toLowerCase() === q);
-    if (exact) return exact.id;
-
-    // fallback: startsWith / includes
-    const starts = players.find((p) => p.name.trim().toLowerCase().startsWith(q));
-    if (starts) return starts.id;
-
-    const inc = players.find((p) => p.name.trim().toLowerCase().includes(q));
-    return inc?.id ?? "";
   }
 
   async function getOrCreatePlayerId(name: string) {
     if (!matchId) return "";
-
     const clean = name.trim();
     if (!clean) return "";
 
-    // 1) check in local state
-    const local = players.find((p) => p.name.toLowerCase() === clean.toLowerCase());
+    // 1) local
+    const local = players.find((p) => p.name.trim().toLowerCase() === clean.toLowerCase());
     if (local) return local.id;
 
-    // 2) check DB
+    // 2) db
     const { data: existing } = await supabase
       .from("match_players")
       .select("id,match_id,team_id,name")
@@ -206,11 +192,11 @@ export default function Score() {
       .maybeSingle();
 
     if (existing?.id) {
-      setPlayers((prev) => [...prev, existing as MatchPlayer]);
+      setPlayers((prev) => (prev.some((x) => x.id === existing.id) ? prev : [...prev, existing as MatchPlayer]));
       return existing.id;
     }
 
-    // 3) create new
+    // 3) create
     const { data: created, error } = await supabase
       .from("match_players")
       .insert({
@@ -227,7 +213,7 @@ export default function Score() {
     }
 
     setPlayers((prev) => [...prev, created as MatchPlayer]);
-    return created.id;
+    return (created as MatchPlayer).id;
   }
 
   async function fetchScoreFromView(id: string) {
@@ -353,6 +339,32 @@ export default function Score() {
     return { legal: true, runs_bat: Number(tag), runs_extras: 0, extra_type: null as string | null, wicket: false };
   }
 
+  function computeNextStrikers(
+    tag: NonWicketTag,
+    evLegal: boolean,
+    currentLegalBalls: number,
+    sId: string,
+    nsId: string
+  ) {
+    let nextS = sId;
+    let nextNS = nsId;
+
+    // odd-run rotation (treat B/LB as 1 in your UI)
+    if (tag === "1" || tag === "3" || tag === "5" || tag === "B" || tag === "LB") {
+      [nextS, nextNS] = [nextNS, nextS];
+    }
+
+    // over end swap only if legal
+    if (evLegal) {
+      const newLegal = currentLegalBalls + 1;
+      if (newLegal % 6 === 0) {
+        [nextS, nextNS] = [nextNS, nextS];
+      }
+    }
+
+    return { nextS, nextNS };
+  }
+
   async function applyBall(tag: NonWicketTag) {
     if (!matchId || !inningRow?.id) return;
     if (!strikerId || !nonStrikerId || !bowlerId) return pushToast("Select striker/non-striker/bowler first");
@@ -363,12 +375,15 @@ export default function Score() {
     const seq = await getNextSeq(inningRow.id);
     const ev = mapEvent(tag);
 
+    const sId = strikerId;
+    const nsId = nonStrikerId;
+
     const { error } = await supabase.from("ball_events").insert({
       innings_id: inningRow.id,
       seq,
       legal: ev.legal,
-      striker_id: strikerId,
-      non_striker_id: nonStrikerId,
+      striker_id: sId,
+      non_striker_id: nsId,
       bowler_id: bowlerId,
       runs_bat: ev.runs_bat,
       runs_extras: ev.runs_extras,
@@ -379,25 +394,13 @@ export default function Score() {
 
     if (error) return pushToast(error.message);
 
-    // strike rotation on odd runs (including bye/lb treated as 1)
-    if (tag === "1" || tag === "3" || tag === "5" || tag === "B" || tag === "LB") {
-      const s = strikerId;
-      setStrikerId(nonStrikerId);
-      setNonStrikerId(s);
-    }
-
-    // end over swap (only if legal)
-    if (ev.legal) {
-      const newLegal = inning.legal_balls + 1;
-      if (newLegal % 6 === 0) {
-        const s = strikerId;
-        setStrikerId(nonStrikerId);
-        setNonStrikerId(s);
-      }
-    }
+    // ✅ compute next ids deterministically (no stale state)
+    const { nextS, nextNS } = computeNextStrikers(tag, ev.legal, inning.legal_balls, sId, nsId);
+    setStrikerId(nextS);
+    setNonStrikerId(nextNS);
 
     await fetchScoreFromView(matchId);
-    const st = await fetchBatterStats(inningRow.id, strikerId, nonStrikerId);
+    const st = await fetchBatterStats(inningRow.id, nextS, nextNS);
     setStats(st);
     await fetchLastBalls(inningRow.id);
   }
@@ -412,14 +415,16 @@ export default function Score() {
 
     const seq = await getNextSeq(inningRow.id);
 
-    const outId = wicketOut === "striker" ? strikerId : nonStrikerId;
+    const sId = strikerId;
+    const nsId = nonStrikerId;
+    const outId = wicketOut === "striker" ? sId : nsId;
 
     const { error } = await supabase.from("ball_events").insert({
       innings_id: inningRow.id,
       seq,
       legal: true,
-      striker_id: strikerId,
-      non_striker_id: nonStrikerId,
+      striker_id: sId,
+      non_striker_id: nsId,
       bowler_id: bowlerId,
       runs_bat: 0,
       runs_extras: 0,
@@ -434,15 +439,18 @@ export default function Score() {
 
     if (error) return pushToast(error.message);
 
-    // replace out batter with next batter in UI
-    if (wicketOut === "striker") setStrikerId(nextBatterId);
-    else setNonStrikerId(nextBatterId);
+    // ✅ replace out batter deterministically
+    const nextS = wicketOut === "striker" ? nextBatterId : sId;
+    const nextNS = wicketOut === "nonStriker" ? nextBatterId : nsId;
+
+    setStrikerId(nextS);
+    setNonStrikerId(nextNS);
 
     setNextBatterId("");
     setShowWicketPicker(false);
 
     await fetchScoreFromView(matchId);
-    const st = await fetchBatterStats(inningRow.id, strikerId, nonStrikerId);
+    const st = await fetchBatterStats(inningRow.id, nextS, nextNS);
     setStats(st);
     await fetchLastBalls(inningRow.id);
   }
@@ -465,7 +473,7 @@ export default function Score() {
     if (error) return pushToast(error.message);
 
     if (matchId) await fetchScoreFromView(matchId);
-    const st = await fetchBatterStats(inningRow.id, strikerId, nonStrikerId);
+    const st = await fetchBatterStats(inningRow.id, strikerIdRef.current, nonStrikerIdRef.current);
     setStats(st);
     await fetchLastBalls(inningRow.id);
   }
@@ -527,7 +535,7 @@ export default function Score() {
       const p = await fetchPlayers(matchId);
       setPlayers(p);
 
-      // default selections: pick first 2 as batters, first as bowler
+      // default selections
       if (p.length >= 2) {
         setStrikerId(p[0].id);
         setNonStrikerId(p[1].id);
@@ -552,7 +560,7 @@ export default function Score() {
     })();
   }, [inningRow?.id, strikerId, nonStrikerId]);
 
-  // Realtime update for this innings
+  // ✅ Realtime update for this innings (stable subscription)
   useEffect(() => {
     if (!matchId || !inningRow?.id) return;
 
@@ -563,8 +571,12 @@ export default function Score() {
         { event: "*", schema: "public", table: "ball_events", filter: `innings_id=eq.${inningRow.id}` },
         async () => {
           await fetchScoreFromView(matchId);
-          if (strikerId && nonStrikerId) {
-            const st = await fetchBatterStats(inningRow.id, strikerId, nonStrikerId);
+
+          const sId = strikerIdRef.current;
+          const nsId = nonStrikerIdRef.current;
+
+          if (sId && nsId) {
+            const st = await fetchBatterStats(inningRow.id, sId, nsId);
             setStats(st);
           }
           await fetchLastBalls(inningRow.id);
@@ -575,7 +587,7 @@ export default function Score() {
     return () => {
       supabase.removeChannel(channel);
     };
-  }, [matchId, inningRow?.id, strikerId, nonStrikerId]);
+  }, [matchId, inningRow?.id]);
 
   const availableNextBatters = useMemo(() => {
     const used = new Set([strikerId, nonStrikerId]);
@@ -584,12 +596,6 @@ export default function Score() {
     if (!q) return list;
     return list.filter((p) => p.name.toLowerCase().includes(q));
   }, [players, strikerId, nonStrikerId, batterSearch]);
-
-  const filteredBowlers = useMemo(() => {
-    const q = bowlerSearch.trim().toLowerCase();
-    if (!q) return players;
-    return players.filter((p) => p.name.toLowerCase().includes(q));
-  }, [players, bowlerSearch]);
 
   const canScore = !!inningRow?.id && !!strikerId && !!nonStrikerId && !!bowlerId;
 
@@ -612,7 +618,6 @@ export default function Score() {
         </div>
       }
     >
-      {/* Add bottom padding so sticky pad doesn't hide content */}
       <div style={{ paddingBottom: CONTENT_BOTTOM_PAD }}>
         {loading ? (
           <Card>Loading…</Card>
@@ -739,7 +744,7 @@ export default function Score() {
                   <Button
                     variant="soft"
                     onClick={() => {
-                      setBowlerSearch("");
+                      setBowlerName("");
                       setShowBowlerPicker(true);
                     }}
                   >
@@ -764,7 +769,7 @@ export default function Score() {
 
             {/* Quick Edit */}
             {showQuickEdit ? (
-              <div className="fixed inset-0 z-[60] flex items-end justify-center p-4 pb-[340px] md:items-center md:pb-4">
+              <div className="fixed inset-0 z-60 flex items-end justify-center p-4 pb-340px md:items-center md:pb-4">
                 <div className="absolute inset-0 bg-black/60" onClick={() => setShowQuickEdit(false)} />
                 <Card className="relative w-full max-w-lg">
                   <div className="flex items-center justify-between">
@@ -779,7 +784,7 @@ export default function Score() {
                       variant="soft"
                       onClick={() => {
                         setShowQuickEdit(false);
-                        setBowlerSearch("");
+                        setBowlerName("");
                         setShowBowlerPicker(true);
                       }}
                     >
@@ -802,49 +807,48 @@ export default function Score() {
               </div>
             ) : null}
 
-            {/* Bowler Picker (SEARCH BOX) */}
+            {/* Bowler Picker (type + create) */}
             {showBowlerPicker ? (
-  <div className="fixed inset-0 z-[60] flex items-end justify-center p-4 pb-[340px] md:items-center md:pb-4">
-    <div className="absolute inset-0 bg-black/60" onClick={() => setShowBowlerPicker(false)} />
-    <Card className="relative w-full max-w-lg max-h-[calc(100vh-360px)] md:max-h-[85vh] overflow-auto">
-      <div className="flex items-center justify-between">
-        <div className="text-lg font-bold">Change Bowler</div>
-        <Button variant="ghost" onClick={() => setShowBowlerPicker(false)}>
-          Close
-        </Button>
-      </div>
+              <div className="fixed inset-0 z-60 flex items-end justify-center p-4 pb-340px md:items-center md:pb-4">
+                <div className="absolute inset-0 bg-black/60" onClick={() => setShowBowlerPicker(false)} />
+                <Card className="relative w-full max-w-lg max-h-[calc(100vh-360px)] md:max-h-[85vh] overflow-auto">
+                  <div className="flex items-center justify-between">
+                    <div className="text-lg font-bold">Change Bowler</div>
+                    <Button variant="ghost" onClick={() => setShowBowlerPicker(false)}>
+                      Close
+                    </Button>
+                  </div>
 
-      <div className="mt-4 grid gap-3">
-        <div className="text-white/60 text-sm">Bowler name</div>
+                  <div className="mt-4 grid gap-3">
+                    <div className="text-white/60 text-sm">Bowler name</div>
 
-        <input
-          value={bowlerName}
-          onChange={(e) => setBowlerName(e.target.value)}
-          placeholder="Type bowler name..."
-          className="w-full h-11 rounded-xl border border-white/10 bg-black/30 px-3 text-white outline-none focus:border-white/25"
-        />
+                    <input
+                      value={bowlerName}
+                      onChange={(e) => setBowlerName(e.target.value)}
+                      placeholder="Type bowler name..."
+                      className="w-full h-11 rounded-xl border border-white/10 bg-black/30 px-3 text-white outline-none focus:border-white/25"
+                    />
 
-        <Button
-          variant="soft"
-          onClick={async () => {
-            const id = await getOrCreatePlayerId(bowlerName);
-            if (!id) return;
-            setBowlerId(id);
-            setShowBowlerPicker(false);
-            pushToast("Bowler updated");
-          }}
-        >
-          Save Bowler
-        </Button>
-      </div>
-    </Card>
-  </div>
-) : null}
+                    <Button
+                      variant="soft"
+                      onClick={async () => {
+                        const id = await getOrCreatePlayerId(bowlerName);
+                        if (!id) return;
+                        setBowlerId(id);
+                        setShowBowlerPicker(false);
+                        pushToast("Bowler updated");
+                      }}
+                    >
+                      Save Bowler
+                    </Button>
+                  </div>
+                </Card>
+              </div>
+            ) : null}
 
-
-            {/* Wicket Picker (SEARCH BOX) */}
+            {/* Wicket Picker */}
             {showWicketPicker ? (
-              <div className="fixed inset-0 z-[60] flex items-end justify-center p-4 pb-[340px] md:items-center md:pb-4">
+              <div className="fixed inset-0 z-60 flex items-end justify-center p-4 pb-340px md:items-center md:pb-4">
                 <div className="absolute inset-0 bg-black/60" onClick={() => setShowWicketPicker(false)} />
                 <Card className="relative w-full max-w-lg max-h-[calc(100vh-360px)] md:max-h-[85vh] overflow-auto">
                   <div className="flex items-center justify-between">
@@ -882,8 +886,9 @@ export default function Score() {
                           <button
                             key={p.id}
                             onClick={() => setNextBatterId(p.id)}
-                            className={`text-left px-4 py-3 rounded-xl border ${p.id === nextBatterId ? "bg-white/10 border-white/20" : "bg-black/20 border-white/10"
-                              }`}
+                            className={`text-left px-4 py-3 rounded-xl border ${
+                              p.id === nextBatterId ? "bg-white/10 border-white/20" : "bg-black/20 border-white/10"
+                            }`}
                           >
                             <div className="font-semibold">{p.name}</div>
                           </button>
@@ -904,11 +909,10 @@ export default function Score() {
         )}
       </div>
 
-      {/* Bottom Score Pad (Sticky + scrollable if tall) */}
+      {/* Bottom Score Pad */}
       <div className="fixed bottom-0 left-0 right-0 z-50">
         <div className="bg-black/50 backdrop-blur-xl border-t border-white/10 px-3 pb-3 pt-2 max-h-[45vh] overflow-y-auto">
           <div className="mx-auto w-full max-w-5xl">
-            {/* Header Row */}
             <div className="flex items-center justify-between gap-3">
               <div className="text-xs text-white/70">
                 <span className="font-semibold text-white/90">Score Pad</span>{" "}
@@ -936,7 +940,6 @@ export default function Score() {
               </div>
             </div>
 
-            {/* RUNS */}
             <div className="mt-3">
               <div className="text-[11px] text-white/50 mb-2">RUNS</div>
               <div className="grid grid-cols-7 gap-2">
@@ -946,12 +949,13 @@ export default function Score() {
                     onClick={() => applyBall(t)}
                     disabled={!canScore}
                     className={`h-11 rounded-2xl border text-base font-semibold transition active:scale-[0.98]
-                    ${!canScore
+                    ${
+                      !canScore
                         ? "opacity-40 border-white/10 bg-white/5"
                         : t === "4" || t === "6"
                           ? "border-blue-400/25 bg-blue-500/15"
                           : "border-white/10 bg-white/8 hover:bg-white/12"
-                      }`}
+                    }`}
                   >
                     {t}
                   </button>
@@ -959,7 +963,6 @@ export default function Score() {
               </div>
             </div>
 
-            {/* EXTRAS */}
             <div className="mt-3">
               <div className="text-[11px] text-white/50 mb-2">EXTRAS</div>
               <div className="grid grid-cols-4 gap-2">
@@ -976,12 +979,13 @@ export default function Score() {
                     onClick={() => applyBall(x.k)}
                     disabled={!canScore}
                     className={`h-11 rounded-2xl border text-sm font-semibold transition active:scale-[0.98]
-                    ${!canScore
+                    ${
+                      !canScore
                         ? "opacity-40 border-white/10 bg-white/5"
                         : x.k === "WD" || x.k === "NB"
                           ? "border-purple-400/25 bg-purple-500/15"
                           : "border-white/10 bg-white/8 hover:bg-white/12"
-                      }`}
+                    }`}
                   >
                     {x.label}
                   </button>
@@ -989,7 +993,6 @@ export default function Score() {
               </div>
             </div>
 
-            {/* ACTION BAR */}
             <div className="mt-3 flex items-center justify-between gap-2">
               <div className="text-[11px] text-white/45">{canScore ? "Ready" : "Pick striker, non-striker & bowler"}</div>
 
@@ -1002,10 +1005,11 @@ export default function Score() {
                 }}
                 disabled={!canScore}
                 className={`h-11 rounded-2xl px-5 font-bold border transition active:scale-[0.98]
-                ${!canScore
+                ${
+                  !canScore
                     ? "opacity-40 border-white/10 bg-white/5"
                     : "border-red-400/25 bg-red-500/25 hover:bg-red-500/30"
-                  }`}
+                }`}
               >
                 W
               </button>
